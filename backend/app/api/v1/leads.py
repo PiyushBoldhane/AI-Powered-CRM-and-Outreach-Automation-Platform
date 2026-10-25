@@ -178,12 +178,7 @@ def claim_lead(
     payload: ClaimLeadRequest = ClaimLeadRequest(),
     current_user: dict = Depends(get_current_user)
 ):
-    """
-    Atomically claims a lead for the authenticated user (or, for admins and
-    campaign managers, for another user via the optional `user_id` field).
-    Uses a conditional UPDATE so concurrent claims race safely in the database:
-    exactly one request wins the row, the other gets 409.
-    """
+    
     target_user_id = payload.user_id or current_user["id"]
 
     if payload.user_id and payload.user_id != current_user["id"]:
