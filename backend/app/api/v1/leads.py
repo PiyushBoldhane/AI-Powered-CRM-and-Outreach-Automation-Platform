@@ -3,13 +3,21 @@ Leads and Opportunities Endpoints.
 Supports listing with filters, pagination, lead detail drawer view, and atomic claiming.
 """
 
+import json
 from typing import Optional, List
 from fastapi import APIRouter, Depends, Query, HTTPException, status
 from pydantic import BaseModel
 
+from backend.app.core.db import transaction
 from backend.app.core.security import get_current_user
 
 router = APIRouter(prefix="/leads", tags=["Leads & Pipeline"])
+
+ADMIN_ASSIGN_ROLES = ["admin", "campaign_manager"]
+
+
+class ClaimLeadRequest(BaseModel):
+    user_id: Optional[str] = None
 
 
 class LeadSummaryDTO(BaseModel):
@@ -165,16 +173,76 @@ def get_lead_by_id(id: str, current_user: dict = Depends(get_current_user)):
 
 
 @router.post("/{id}/claim")
-def claim_lead(id: str, current_user: dict = Depends(get_current_user)):
-    """Atomically claims a lead for the authenticated user."""
-    for lead in SAMPLE_LEADS:
-        if lead["id"] == id:
-            if lead["assigned_to"] and lead["assigned_to"] != current_user["id"]:
+def claim_lead(
+    id: str,
+    payload: ClaimLeadRequest = ClaimLeadRequest(),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Atomically claims a lead for the authenticated user (or, for admins and
+    campaign managers, for another user via the optional `user_id` field).
+    Uses a conditional UPDATE so concurrent claims race safely in the database:
+    exactly one request wins the row, the other gets 409.
+    """
+    target_user_id = payload.user_id or current_user["id"]
+
+    if payload.user_id and payload.user_id != current_user["id"]:
+        if current_user.get("role") not in ADMIN_ASSIGN_ROLES:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only admins and campaign managers may assign leads to another user"
+            )
+
+    with transaction() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE opportunities
+                SET assigned_to = %s, claimed_at = NOW()
+                WHERE id = %s AND assigned_to IS NULL
+                RETURNING id, assigned_to, claimed_at, status;
+                """,
+                (target_user_id, id)
+            )
+            updated = cur.fetchone()
+
+            if updated is None:
+                cur.execute("SELECT assigned_to FROM opportunities WHERE id = %s;", (id,))
+                existing = cur.fetchone()
+                if existing is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail=f"Lead with id '{id}' not found"
+                    )
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
-                    detail="Lead is already claimed by another team member"
+                    detail="Lead has already been claimed by another team member"
                 )
-            lead["assigned_to"] = current_user["id"]
-            return lead
 
-    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lead not found")
+            columns = [desc[0] for desc in cur.description]
+            lead_row = dict(zip(columns, updated))
+
+            cur.execute(
+                """
+                INSERT INTO audit_logs (actor, action, entity_type, entity_id, details)
+                VALUES (%s, %s, %s, %s, %s);
+                """,
+                (
+                    current_user["id"],
+                    "lead_claimed",
+                    "opportunity",
+                    id,
+                    json.dumps({
+                        "claimed_by": target_user_id,
+                        "assigned_by": current_user["id"],
+                        "assigned_by_role": current_user.get("role")
+                    })
+                )
+            )
+
+    return {
+        "id": str(lead_row["id"]),
+        "assigned_to": str(lead_row["assigned_to"]),
+        "claimed_at": lead_row["claimed_at"].isoformat(),
+        "status": lead_row["status"]
+    }
